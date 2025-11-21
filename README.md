@@ -593,8 +593,6 @@ MIT License - Free for commercial use
 
 ---
 
-**Built with ❤️ for retail professionals**
-
 **Version**: 1.0.0
 **Last Updated**: 2024
 **Status**: ✅ Production Ready

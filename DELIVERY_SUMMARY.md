@@ -582,5 +582,3 @@ You now have:
 **Understand the Code**: Read PROJECT_STRUCTURE.md
 
 **Deploy**: Follow deployment section in SETUP_GUIDE.md
-
-**Built with ❤️ for retail professionals**
