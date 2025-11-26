@@ -36,7 +36,7 @@ from app.schemas.detection import DetectionResponse, QuestionRequest, QuestionRe
 
 # Import services
 from app.services.yolo_service import YOLODetectionService
-from app.services.gemini_service import GeminiAnalysisService
+from app.services.analysis_service import AnalysisService
 
 # Import security utilities
 from app.core.security import SecurityUtils
@@ -68,27 +68,15 @@ if wait_for_db():
 else:
     print("⚠️ Skipping database table creation due to connection failure")
 
-    # Initialize services with error handling
+# Initialize the main analysis service
 try:
-    yolo_service = YOLODetectionService()
-    print("✅ YOLO service initialized successfully")
+    analysis_service = AnalysisService()
+    print("✅ Analysis service initialized successfully")
 except Exception as e:
-    print(f"❌ YOLO service initialization failed: {e}")
-    print("⚠️  Object detection will not be available")
-    yolo_service = None
+    print(f"❌ Analysis service initialization failed: {e}")
+    analysis_service = None
 
-gemini_service = GeminiAnalysisService() if settings.GEMINI_API_KEY else None
-if gemini_service and gemini_service.model:
-    print("✅ Gemini service initialized successfully")
-else:
-    print("⚠️  Gemini service not available (GEMINI_API_KEY not configured)")
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
-# Initialize services
-yolo_service = YOLODetectionService()
-gemini_service = GeminiAnalysisService() if settings.GEMINI_API_KEY else None
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -245,6 +233,13 @@ async def create_detection(
             detail=f"Invalid file type. Allowed: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         )
     
+    # Check if analysis service is available
+    if not analysis_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis service is not available. Please try again later."
+        )
+    
     # Generate unique filename
     unique_id = str(uuid.uuid4())
     original_filename = f"{unique_id}{file_ext}"
@@ -268,16 +263,23 @@ async def create_detection(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
     
-    # Run YOLO detection
+    # Run complete analysis pipeline
     try:
-        detections, analysis = yolo_service.detect_objects(original_path, annotated_path)
+        print("🔄 Starting image analysis pipeline...")
+        analysis_result = analysis_service.analyze_image(original_path, annotated_path)
+        
+        detections = analysis_result["detections"]
+        analysis = analysis_result["analysis"]
+        retail_analysis = analysis_result["retail_analysis"]
         
         # Create thumbnail
-        yolo_service.create_thumbnail(annotated_path, thumbnail_path)
+        analysis_service.yolo_service.create_thumbnail(annotated_path, thumbnail_path)
         
         # Get image dimensions
         img = Image.open(original_path)
         img_width, img_height = img.size
+        
+        print("✅ Image analysis completed successfully")
         
     except Exception as e:
         # Cleanup files
@@ -285,64 +287,6 @@ async def create_detection(
             if os.path.exists(path):
                 os.remove(path)
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
-    
-    # Perform Gemini analysis for retail products - with proper error handling
-    retail_analysis = {
-        "brands_detected": [],
-        "product_categories": [],
-        "positioning_analysis": "Gemini analysis not available due to API quota limits",
-        "recommendations": [],
-        "positioning_details": []
-    }
-    
-    if gemini_service:
-        try:
-            retail_analysis = gemini_service.analyze_retail_products(
-                annotated_path, detections, analysis
-            )
-            # Ensure retail_analysis is always a dictionary
-            if not isinstance(retail_analysis, dict):
-                retail_analysis = {
-                    "brands_detected": [],
-                    "product_categories": [],
-                    "positioning_analysis": "Analysis completed but returned unexpected format",
-                    "recommendations": [],
-                    "positioning_details": []
-                }
-                
-        except Exception as e:
-            print(f"Retail analysis error: {e}")
-            # Create a proper error structure instead of error string
-            retail_analysis = {
-                "brands_detected": [],
-                "product_categories": [],
-                "positioning_analysis": f"Gemini analysis unavailable: {str(e)}",
-                "recommendations": ["Please check your Gemini API quota and billing settings"],
-                "positioning_details": []
-            }
-    
-    # Merge with YOLO analysis - ensure analysis is always a proper dictionary
-    if not isinstance(analysis, dict):
-        analysis = {}
-    
-    analysis["retail_analysis"] = retail_analysis
-    
-    # Ensure analysis_data is JSON serializable and valid
-    try:
-        # Validate that analysis is a proper dictionary
-        analysis_data_str = json.dumps(analysis)
-        # Test that it can be loaded back (this will catch any serialization issues)
-        analysis_data_valid = json.loads(analysis_data_str)
-    except (TypeError, ValueError) as e:
-        print(f"Analysis data serialization error: {e}")
-        # Create a safe fallback analysis data
-        analysis = {
-            "total_objects": len(detections),
-            "class_distribution": {},
-            "avg_confidence": 0.0,
-            "image_dimensions": {"width": img_width, "height": img_height},
-            "retail_analysis": retail_analysis
-        }
     
     # Save to database
     db_detection = Detection(
@@ -354,7 +298,7 @@ async def create_detection(
         image_width=img_width,
         image_height=img_height,
         total_objects=len(detections),
-        analysis_data=json.dumps(analysis)
+        analysis_data=json.dumps(analysis)  # This now includes retail_analysis
     )
     
     db.add(db_detection)
@@ -501,25 +445,25 @@ async def ask_question(
         for obj in detection.objects
     ]
     
-    # Check if Gemini service is available
-    if not gemini_service or not gemini_service.model:
+    # Check if analysis service is available
+    if not analysis_service:
         # Provide a helpful fallback response
-        fallback_answer = self._generate_fallback_answer(request.question, detection, objects)
+        fallback_answer = _generate_fallback_answer(request.question, detection, objects)
         return {
             "answer": fallback_answer,
             "detection_id": detection.id
         }
     
-    # Get answer from Gemini
+    # Get answer from analysis service
     try:
         print(f"🔍 Asking question about detection {detection.id}: {request.question}")
-        answer = gemini_service.answer_question(request.question, detection, objects)
+        answer = analysis_service.answer_question(request.question, detection, objects)
         print("✅ Question answered successfully")
         
     except Exception as e:
-        print(f"❌ Gemini Q&A error: {e}")
+        print(f"❌ Question answering error: {e}")
         # Provide fallback instead of failing completely
-        fallback_answer = self._generate_fallback_answer(request.question, detection, objects, str(e))
+        fallback_answer = _generate_fallback_answer(request.question, detection, objects, str(e))
         answer = fallback_answer
     
     return {
@@ -527,6 +471,35 @@ async def ask_question(
         "detection_id": detection.id
     }
 
+def _generate_fallback_answer(question: str, detection: Detection, objects: List[Dict], error_msg: str = "") -> str:
+    """Generate a fallback answer when AI service is unavailable"""
+    question_lower = question.lower()
+    
+    # Basic question answering based on detection data
+    if any(word in question_lower for word in ['how many', 'count', 'number']):
+        object_count = len(objects)
+        class_summary = {}
+        for obj in objects:
+            class_summary[obj['class_name']] = class_summary.get(obj['class_name'], 0) + 1
+        
+        class_details = ", ".join([f"{count} {cls}" for cls, count in class_summary.items()])
+        return f"I detected {object_count} objects in total: {class_details}. " + \
+               (f"(Note: AI analysis is currently unavailable due to: {error_msg})" if error_msg else "")
+    
+    elif any(word in question_lower for word in ['what', 'detect', 'see', 'find']):
+        classes = list(set(obj['class_name'] for obj in objects))
+        class_list = ", ".join(classes)
+        return f"I detected the following objects: {class_list}. " + \
+               (f"(AI analysis limited due to: {error_msg})" if error_msg else "")
+    
+    elif any(word in question_lower for word in ['where', 'position', 'location']):
+        return "I can detect object positions, but detailed spatial analysis requires the AI service which is currently unavailable. " + \
+               (f"Error: {error_msg}" if error_msg else "")
+    
+    else:
+        return "I can answer basic questions about detected objects, but detailed analysis is currently unavailable. " + \
+               (f"AI service error: {error_msg}" if error_msg else "Please check your AI model configuration.")
+    
 def _generate_fallback_answer(self, question: str, detection: Detection, objects: List[Dict], error_msg: str = "") -> str:
     """Generate a fallback answer when Gemini is unavailable"""
     question_lower = question.lower()
@@ -665,17 +638,18 @@ async def get_detection_insights(
 @app.get("/api/v1/analysis/status")
 async def get_ai_service_status():
     """Get the status of AI services"""
-    yolo_status = "available" if yolo_service else "unavailable"
-    gemini_status = "available" if gemini_service and gemini_service.model else "unavailable"
+    service_status = "available" if analysis_service else "unavailable"
+    yolo_status = "available" if analysis_service and analysis_service.yolo_service else "unavailable"
+    local_model_status = "available" if analysis_service and analysis_service.local_model_service else "unavailable"
     
     return {
         "services": {
+            "analysis_service": service_status,
             "object_detection": yolo_status,
-            "ai_analysis": gemini_status
+            "local_ai_analysis": local_model_status
         },
         "timestamp": datetime.utcnow().isoformat()
     }
-
 # ============================================================================
 # HEALTH CHECK & ROOT
 # ============================================================================
