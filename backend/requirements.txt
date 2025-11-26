@@ -15,7 +15,7 @@ ultralytics==8.0.200
 google-generativeai==0.3.2
 aiofiles==23.2.1
 python-magic==0.4.27
-numpy==1.24.3
+numpy>=1.25.0
 pydantic==2.5.0
 pydantic-settings==2.1.0
 email-validator==2.1.0
@@ -26,9 +26,9 @@ pytest-asyncio==0.21.1
 httpx==0.25.2
 
 # Update your requirements.txt with these additions
-transformers==4.35.2
-torch==2.1.1
-torchvision==0.16.1
+torch>=2.2.0  # 2.2+ has 3.12 wheels
+torchvision>=0.17.0  # Matches torch 2.2+
+# Optionally: transformers>=4.36.0 for better 3.12 stability
 accelerate==0.24.1
 safetensors==0.4.1
 bitsandbytes==0.41.3
