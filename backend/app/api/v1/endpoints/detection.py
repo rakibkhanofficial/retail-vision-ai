@@ -1,28 +1,34 @@
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
+from sqlalchemy.orm import Session
+from typing import List, Optional
 import os
 import uuid
 import json
 import aiofiles
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
-from sqlalchemy.orm import Session
-from typing import List, Optional
+from datetime import datetime
 from PIL import Image
 
 from app.db.session import get_db
 from app.models.user import User
-from app.models.detection import Detection, DetectedObject, ProductPosition
-from app.schemas.detection import DetectionResponse, DetectionCreate
-from app.api.deps import get_current_user
-from app.services.yolo_service import YOLODetectionService
-from app.services.gemini_service import GeminiAnalysisService
+from app.models.detection import Detection, DetectedObject
+from app.models.product import ProductPosition
+from app.schemas.detection import DetectionResponse
 from app.core.config import settings
+from app.api.deps import get_current_user
+from app.services.analysis_service import AnalysisService
 
 router = APIRouter()
 
-yolo_service = YOLODetectionService()
-gemini_service = GeminiAnalysisService() if settings.GEMINI_API_KEY else None
+# Initialize analysis service
+try:
+    analysis_service = AnalysisService()
+    print("✅ Analysis service initialized successfully")
+except Exception as e:
+    print(f"❌ Analysis service initialization failed: {e}")
+    analysis_service = None
 
-@router.post("", response_model=DetectionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/detections", response_model=DetectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_detection(
     file: UploadFile = File(...),
     name: Optional[str] = Form(None),
@@ -38,6 +44,12 @@ async def create_detection(
             detail=f"Invalid file type. Allowed: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         )
     
+    if not analysis_service:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis service is not available. Please try again later."
+        )
+    
     # Generate unique filename
     unique_id = str(uuid.uuid4())
     original_filename = f"{unique_id}{file_ext}"
@@ -48,6 +60,11 @@ async def create_detection(
     annotated_path = os.path.join(settings.UPLOAD_DIR, "annotated", annotated_filename)
     thumbnail_path = os.path.join(settings.UPLOAD_DIR, "thumbnails", thumbnail_filename)
     
+    # Ensure directories exist
+    os.makedirs(os.path.dirname(original_path), exist_ok=True)
+    os.makedirs(os.path.dirname(annotated_path), exist_ok=True)
+    os.makedirs(os.path.dirname(thumbnail_path), exist_ok=True)
+    
     # Save uploaded file
     try:
         async with aiofiles.open(original_path, 'wb') as f:
@@ -56,16 +73,23 @@ async def create_detection(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
     
-    # Run YOLO detection
+    # Run complete analysis pipeline
     try:
-        detections, analysis = yolo_service.detect_objects(original_path, annotated_path)
+        print("🔄 Starting image analysis pipeline...")
+        analysis_result = analysis_service.analyze_image(original_path, annotated_path)
+        
+        detections = analysis_result["detections"]
+        analysis = analysis_result["analysis"]
+        retail_analysis = analysis_result["retail_analysis"]
         
         # Create thumbnail
-        yolo_service.create_thumbnail(annotated_path, thumbnail_path)
+        analysis_service.yolo_service.create_thumbnail(annotated_path, thumbnail_path)
         
         # Get image dimensions
         img = Image.open(original_path)
         img_width, img_height = img.size
+        
+        print("✅ Image analysis completed successfully")
         
     except Exception as e:
         # Cleanup files
@@ -74,22 +98,10 @@ async def create_detection(
                 os.remove(path)
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
     
-    # Perform Gemini analysis for retail products
-    retail_analysis = {}
-    if gemini_service:
-        try:
-            retail_analysis = gemini_service.analyze_retail_products(
-                annotated_path, detections, analysis
-            )
-            # Merge with YOLO analysis
-            analysis.update({"retail_analysis": retail_analysis})
-        except Exception as e:
-            print(f"Retail analysis error: {e}")
-    
     # Save to database
     db_detection = Detection(
         user_id=current_user.id,
-        name=name or f"Detection {uuid.uuid4().hex[:8]}",
+        name=name or f"Detection {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
         original_image=f"/uploads/original/{original_filename}",
         annotated_image=f"/uploads/annotated/{annotated_filename}",
         thumbnail=f"/uploads/thumbnails/{thumbnail_filename}",
@@ -121,7 +133,7 @@ async def create_detection(
         )
         db.add(db_object)
     
-    # Save product positions (if available from retail analysis)
+    # Save product positions
     if retail_analysis.get("positioning_details"):
         for product_info in retail_analysis.get("positioning_details", []):
             if isinstance(product_info, dict):
@@ -146,7 +158,7 @@ async def create_detection(
     
     return db_detection
 
-@router.get("", response_model=List[DetectionResponse])
+@router.get("/detections", response_model=List[DetectionResponse])
 async def list_detections(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
@@ -163,7 +175,7 @@ async def list_detections(
     
     return detections
 
-@router.get("/{detection_id}", response_model=DetectionResponse)
+@router.get("/detections/{detection_id}", response_model=DetectionResponse)
 async def get_detection(
     detection_id: int,
     current_user: User = Depends(get_current_user),
@@ -180,7 +192,7 @@ async def get_detection(
     
     return detection
 
-@router.delete("/{detection_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/detections/{detection_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_detection(
     detection_id: int,
     current_user: User = Depends(get_current_user),
@@ -198,11 +210,10 @@ async def delete_detection(
     # Delete associated files
     for image_path in [detection.original_image, detection.annotated_image, detection.thumbnail]:
         if image_path:
-            full_path = f"/app{image_path}"
+            full_path = os.path.join("/app", image_path.lstrip("/"))
             if os.path.exists(full_path):
                 os.remove(full_path)
     
-    # Delete from database (cascades to objects and products)
     db.delete(detection)
     db.commit()
     

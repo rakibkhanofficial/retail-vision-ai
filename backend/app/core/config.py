@@ -31,8 +31,13 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "/app/uploads"
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
     ALLOWED_EXTENSIONS: List[str] = [".jpg", ".jpeg", ".png", ".webp"]
-    
+
+    # Torch
+    TORCH_WEIGHTS_ONLY: bool = False  # <-- added field for your env
+
     class Config:
         env_file = ".env"
+        extra = "ignore"  # <-- ignore any other extra env variables
 
+# Create a settings instance
 settings = Settings()
