@@ -41,6 +41,8 @@ from app.services.analysis_service import AnalysisService
 # Import security utilities
 from app.core.security import SecurityUtils
 
+from fastapi.staticfiles import StaticFiles
+
 # Wait for database to be ready
 def wait_for_db():
     max_retries = 10
@@ -75,8 +77,6 @@ try:
 except Exception as e:
     print(f"❌ Analysis service initialization failed: {e}")
     analysis_service = None
-
-
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -117,6 +117,8 @@ app.add_middleware(
 
 # Mount static files
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 # ============================================================================
 # DEPENDENCY FUNCTIONS
